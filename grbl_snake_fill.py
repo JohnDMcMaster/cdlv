@@ -6,6 +6,8 @@ GRBL laser: fill a rectangle with a horizontal snake raster (bidirectional passe
 from __future__ import annotations
 
 import argparse
+import itertools
+import re
 import sys
 import time
 
@@ -15,6 +17,34 @@ DEFAULT_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUD = 115200
 DEFAULT_LPMM = 10.0
 DEFAULT_FEED_MM_MIN = 1200.0
+
+# Grbl 1.1 gcode.c — common execution errors (subset).
+GRBL_ERROR_HELP: dict[int, str] = {
+    1: "Expected command letter (bad line, blank line, or serial corruption).",
+    2: "Bad number format.",
+    3: "Invalid statement (unsupported command).",
+    4: "Value < 0.",
+    5: "Modal group violation.",
+    6: "Undefined feed rate.",
+    7: "Command requires integer.",
+    8: "Axis command conflict.",
+    9: "Word repeated in block.",
+    10: "Command requires a value.",
+    11: "G53 requires G0 or G1.",
+    12: "Axis words missing.",
+    13: "Invalid line number.",
+    14: "Value out of range.",
+    15: "Too many words in block.",
+    16: "Homing not enabled.",
+    17: "Line overflow.",
+    18: "RPM out of range.",
+    20: "Unsupported command.",
+    21: "Modal group violation (motion).",
+    22: "Invalid value for word.",
+    23: "G-code sentence not supported.",
+    24: "Axis words missing in plane selection.",
+    25: "Invalid arc plane.",
+}
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -61,7 +91,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=1,
         metavar="N",
-        help="Repeat the full fill this many times (ignored in dry-run; default: %(default)s).",
+        help=(
+            "Repeat the full fill this many times; use 0 to run until interrupted "
+            "(ignored in dry-run; default: %(default)s)."
+        ),
     )
     p.add_argument(
         "--fill",
@@ -102,15 +135,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="MM/MIN",
         help=f"Feed rate for G1 moves (default: {DEFAULT_FEED_MM_MIN}).",
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Log each sent line and GRBL responses to stderr.",
+    )
+    p.add_argument(
+        "--line-delay",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Optional pause after each acknowledged line (helps flaky USB; default: 0).",
+    )
     args = p.parse_args(argv)
     if args.width <= 0 or args.height <= 0:
         p.error("width and height must be positive.")
     if args.lpmm <= 0:
         p.error("--lpmm must be positive.")
-    if args.passes < 1:
-        p.error("--passes must be at least 1.")
+    if args.passes < 0:
+        p.error("--passes must be non-negative (0 = run forever).")
     if not 1 <= args.power <= 100:
         p.error("--power must be between 1 and 100.")
+    if args.line_delay < 0:
+        p.error("--line-delay must be non-negative.")
     return args
 
 
@@ -125,7 +172,59 @@ def row_y_positions(height_mm: float, rows: int) -> list[float]:
     return [height_mm * i / (rows - 1) for i in range(rows)]
 
 
-def read_grbl_responses(ser: serial.Serial, timeout_s: float = 30.0) -> None:
+def fmt_axis(v: float) -> str:
+    """Format a coordinate for GRBL (3 decimals, trim trailing zeros)."""
+    s = f"{v:.3f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def fmt_feed(f: float) -> str:
+    s = f"{f:.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _line_requires_motion_sync(line: str) -> bool:
+    """True for G0/G00/G1/G01 blocks (motion that should finish before the next command)."""
+    s = line.strip().upper()
+    if not s.startswith("G"):
+        return False
+    i = 1
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    gword = s[:i]
+    return gword in ("G0", "G00", "G1", "G01")
+
+
+_RE_ERROR = re.compile(r"^error:\s*(\d+)", re.I)
+
+
+def _classify_line(decoded: str) -> str:
+    if not decoded:
+        return "empty"
+    if decoded.lower() == "ok":
+        return "ok"
+    if _RE_ERROR.match(decoded):
+        return "error"
+    if decoded.startswith("<") and "|" in decoded:
+        return "status"
+    if decoded.startswith("[") and decoded.endswith("]"):
+        return "bracket"
+    if decoded.lower().startswith("grbl"):
+        return "welcome"
+    if "error" in decoded.lower() or decoded.lower().startswith("alarm"):
+        return "errorish"
+    return "other"
+
+
+def read_until_ok(
+    ser: serial.Serial,
+    timeout_s: float = 30.0,
+    verbose: bool = False,
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         line = ser.readline()
@@ -134,22 +233,119 @@ def read_grbl_responses(ser: serial.Serial, timeout_s: float = 30.0) -> None:
         decoded = line.decode(errors="replace").strip()
         if not decoded:
             continue
-        lower = decoded.lower()
-        if "error" in lower or lower.startswith("alarm"):
-            raise RuntimeError(f"GRBL: {decoded}")
-        if lower == "ok":
+        if verbose:
+            print(f"< {decoded}", file=sys.stderr)
+        kind = _classify_line(decoded)
+        if kind == "ok":
             return
+        if kind == "error":
+            m = _RE_ERROR.match(decoded)
+            code = int(m.group(1)) if m else -1
+            hint = GRBL_ERROR_HELP.get(code, "")
+            extra = f" {hint}" if hint else ""
+            raise RuntimeError(f"GRBL: {decoded}{extra}")
+        if kind == "errorish":
+            raise RuntimeError(f"GRBL: {decoded}")
+        # status, bracket, welcome, other: keep reading until ok
     raise TimeoutError("Timed out waiting for GRBL 'ok'.")
 
 
-def send_line(ser: serial.Serial, line: str) -> None:
-    ser.write((line.strip() + "\r\n").encode("ascii", errors="strict"))
-    read_grbl_responses(ser)
+def wait_for_idle(
+    ser: serial.Serial,
+    *,
+    verbose: bool = False,
+    timeout_s: float = 600.0,
+) -> None:
+    """
+    Poll GRBL with realtime '?' until status reports Idle.
 
-
-def ensure_laser_off(ser: serial.Serial) -> None:
+    A line's 'ok' only means the block was accepted into the planner, not that
+    motion finished; this waits for the machine to finish the current moves.
+    """
+    deadline = time.monotonic() + timeout_s
+    saved_timeout = ser.timeout
+    ser.timeout = 0.2
     try:
-        send_line(ser, "M5")
+        while time.monotonic() < deadline:
+            ser.write(b"?")
+            inner = time.monotonic() + 0.4
+            while time.monotonic() < inner:
+                raw = ser.readline()
+                if not raw:
+                    break
+                text = raw.decode(errors="replace").strip()
+                if verbose:
+                    print(f"< ? {text}", file=sys.stderr)
+                if text.startswith("<") and "|" in text:
+                    state = text[1:].split("|")[0]
+                    if state == "Idle":
+                        return
+                    if state.startswith("Alarm") or state == "Check":
+                        raise RuntimeError(f"GRBL cannot reach Idle: {text}")
+        raise TimeoutError("Timed out waiting for GRBL Idle.")
+    finally:
+        ser.timeout = saved_timeout
+
+
+def drain_serial(ser: serial.Serial, verbose: bool = False) -> None:
+    """Discard boot banner and stray bytes (time-bounded; cannot hang on status spam)."""
+    t_end = time.monotonic() + 1.5
+    while time.monotonic() < t_end:
+        n = ser.in_waiting
+        if n:
+            ser.read(n)
+            if verbose:
+                print(f"< [drain {n}b]", file=sys.stderr)
+        else:
+            time.sleep(0.02)
+
+
+def send_line(
+    ser: serial.Serial,
+    line: str,
+    *,
+    verbose: bool = False,
+    line_delay: float = 0.0,
+    retries: int = 3,
+) -> None:
+    line = line.strip()
+    if not line:
+        raise ValueError("Refusing to send an empty G-code line.")
+    last_err: RuntimeError | None = None
+    for attempt in range(retries):
+        if attempt and verbose:
+            print(f"(retry {attempt + 1}/{retries})", file=sys.stderr)
+        if verbose:
+            print(f"> {line}", file=sys.stderr)
+        ser.write((line + "\r\n").encode("ascii", errors="strict"))
+        ser.flush()
+        try:
+            read_until_ok(ser, verbose=verbose)
+            if line_delay > 0:
+                time.sleep(line_delay)
+            if _line_requires_motion_sync(line):
+                wait_for_idle(ser, verbose=verbose)
+            return
+        except RuntimeError as e:
+            last_err = e
+            msg = str(e).lower()
+            if "error:1" not in msg and "expected command letter" not in msg:
+                raise
+            if attempt >= retries - 1:
+                raise
+            time.sleep(0.03 * (2**attempt))
+            drain_serial(ser, verbose=verbose)
+    assert last_err is not None
+    raise last_err
+
+
+def ensure_laser_off(
+    ser: serial.Serial,
+    verbose: bool = False,
+    line_delay: float = 0.0,
+) -> None:
+    try:
+        send_line(ser, "M5", verbose=verbose, line_delay=line_delay)
     except Exception:
         pass
 
@@ -161,20 +357,55 @@ def run_dry_perimeter(
     width: float,
     height: float,
     feed: float,
+    *,
+    verbose: bool,
+    line_delay: float,
 ) -> None:
-    send_line(ser, "G21")
-    send_line(ser, "G90")
-    send_line(ser, "M5")
+    send_line(ser, "G21", verbose=verbose, line_delay=line_delay)
+    send_line(ser, "G90", verbose=verbose, line_delay=line_delay)
+    send_line(ser, "M5", verbose=verbose, line_delay=line_delay)
     x0, y0 = sx, sy
     x1, y1 = sx + width, sy
     x2, y2 = sx + width, sy + height
     x3, y3 = sx, sy + height
-    send_line(ser, f"G0 X{x0:.4f} Y{y0:.4f}")
-    send_line(ser, f"G1 X{x1:.4f} Y{y1:.4f} F{feed:.2f}")
-    send_line(ser, f"G1 X{x2:.4f} Y{y2:.4f} F{feed:.2f}")
-    send_line(ser, f"G1 X{x3:.4f} Y{y3:.4f} F{feed:.2f}")
-    send_line(ser, f"G1 X{x0:.4f} Y{y0:.4f} F{feed:.2f}")
-    send_line(ser, f"G0 X{x0:.4f} Y{y0:.4f}")
+    fx, fy = fmt_axis, fmt_axis
+    ff = fmt_feed
+    send_line(
+        ser,
+        f"G0 X{fx(x0)} Y{fy(y0)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
+    send_line(
+        ser,
+        f"G1 X{fx(x1)} Y{fy(y1)} F{ff(feed)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
+    send_line(
+        ser,
+        f"G1 X{fx(x2)} Y{fy(y2)} F{ff(feed)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
+    send_line(
+        ser,
+        f"G1 X{fx(x3)} Y{fy(y3)} F{ff(feed)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
+    send_line(
+        ser,
+        f"G1 X{fx(x0)} Y{fy(y0)} F{ff(feed)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
+    send_line(
+        ser,
+        f"G0 X{fx(x0)} Y{fy(y0)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
 
 
 def run_snake_fill(
@@ -186,14 +417,25 @@ def run_snake_fill(
     passes: int,
     power: int,
     feed: float,
+    *,
+    verbose: bool,
+    line_delay: float,
 ) -> None:
-    send_line(ser, "G21")
-    send_line(ser, "G90")
-    send_line(ser, f"G0 X{sx:.4f} Y{sy:.4f}")
+    fx, fy = fmt_axis, fmt_axis
+    ff = fmt_feed
+    send_line(ser, "G21", verbose=verbose, line_delay=line_delay)
+    send_line(ser, "G90", verbose=verbose, line_delay=line_delay)
+    send_line(
+        ser,
+        f"G0 X{fx(sx)} Y{fy(sy)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
 
-    send_line(ser, f"M3 S{power}")
+    send_line(ser, f"M3 S{power}", verbose=verbose, line_delay=line_delay)
 
-    for p in range(passes):
+    pass_iter = itertools.count(0) if passes == 0 else range(passes)
+    for p in pass_iter:
         for i, y_local in enumerate(ys):
             y = sy + y_local
             if i % 2 == 0:
@@ -203,13 +445,33 @@ def run_snake_fill(
 
             first_segment = p == 0 and i == 0
             if not first_segment:
-                send_line(ser, "M5")
-                send_line(ser, f"G0 X{x0:.4f} Y{y:.4f}")
-                send_line(ser, f"M3 S{power}")
-            send_line(ser, f"G1 X{x1:.4f} Y{y:.4f} F{feed:.2f}")
+                send_line(ser, "M5", verbose=verbose, line_delay=line_delay)
+                send_line(
+                    ser,
+                    f"G0 X{fx(x0)} Y{fy(y)}",
+                    verbose=verbose,
+                    line_delay=line_delay,
+                )
+                send_line(
+                    ser,
+                    f"M3 S{power}",
+                    verbose=verbose,
+                    line_delay=line_delay,
+                )
+            send_line(
+                ser,
+                f"G1 X{fx(x1)} Y{fy(y)} F{ff(feed)}",
+                verbose=verbose,
+                line_delay=line_delay,
+            )
 
-    send_line(ser, "M5")
-    send_line(ser, f"G0 X{sx:.4f} Y{sy:.4f}")
+    send_line(ser, "M5", verbose=verbose, line_delay=line_delay)
+    send_line(
+        ser,
+        f"G0 X{fx(sx)} Y{fy(sy)}",
+        verbose=verbose,
+        line_delay=line_delay,
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -218,6 +480,8 @@ def main(argv: list[str]) -> int:
     rows = row_count(args.height, args.lpmm)
     ys = row_y_positions(args.height, rows)
     sx, sy = args.start_x, args.start_y
+    verbose = args.verbose
+    line_delay = args.line_delay
 
     ser: serial.Serial | None = None
     try:
@@ -228,10 +492,19 @@ def main(argv: list[str]) -> int:
             write_timeout=2.0,
         )
         time.sleep(2.0)
-        ser.reset_input_buffer()
+        drain_serial(ser, verbose=verbose)
 
         if dry_run:
-            run_dry_perimeter(ser, sx, sy, args.width, args.height, args.feed)
+            run_dry_perimeter(
+                ser,
+                sx,
+                sy,
+                args.width,
+                args.height,
+                args.feed,
+                verbose=verbose,
+                line_delay=line_delay,
+            )
         else:
             run_snake_fill(
                 ser,
@@ -242,10 +515,12 @@ def main(argv: list[str]) -> int:
                 args.passes,
                 args.power,
                 args.feed,
+                verbose=verbose,
+                line_delay=line_delay,
             )
     finally:
         if ser is not None:
-            ensure_laser_off(ser)
+            ensure_laser_off(ser, verbose=verbose, line_delay=line_delay)
             ser.close()
 
     return 0
